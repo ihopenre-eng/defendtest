@@ -1,27 +1,23 @@
 import os
 import uuid
 import magic
-import clamd
+import hashlib
+import struct
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from PIL import Image, UnidentifiedImageError
+import io
 
 app = Flask(__name__)
 
-# ==================== 보안 설정 ====================
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 최대 50MB
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024 
+Image.MAX_IMAGE_PIXELS = 50_000_000  
 
-# PIL decompression bomb / pixel flood 방어 (DoS 방지)
-Image.MAX_IMAGE_PIXELS = 100_000_000  # 약 10,000 × 10,000 픽셀 정도까지만 허용
-
-# 웹 루트 외부의 안전한 저장 디렉토리
 SECURE_UPLOAD_FOLDER = 'secure_uploads'
 os.makedirs(SECURE_UPLOAD_FOLDER, exist_ok=True)
 
-# 허용 확장자 (Whitelist)  docx 완전 제거 (매크로/XXE/SSRF 위험)
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'pdf'}
 
-# 허용 MIME 타입 (정확한 exact match로 강화)
 ALLOWED_MIMES = {
     'image/jpeg',
     'image/png',
@@ -29,155 +25,276 @@ ALLOWED_MIMES = {
     'application/pdf'
 }
 
-# ClamAV 시뮬레이션: Windows 환경 및 테스트 속도를 위한 시그니처 기반 다운그레이드 모킹
-MALWARE_SIGNATURES = [
-    b'<?php', b'<? ', b'<%', b'eval(', b'exec(', b'system(',
-    b'passthru(', b'shell_exec(', b'base64_decode(', b'assert(',
-    b'preg_replace', b'cmd.exe', b'/bin/sh', b'/bin/bash',
-    b'powershell', b'WScript.Shell', b'CreateObject',
+# ── 매직 바이트 정의 (오프셋, 바이트) ──────────────────────────────
+MAGIC_SIGNATURES = {
+    'image/jpeg': [(0, b'\xff\xd8\xff')],
+    'image/png':  [(0, b'\x89PNG\r\n\x1a\n')],
+    'image/gif':  [(0, b'GIF87a'), (0, b'GIF89a')],
+    'application/pdf': [(0, b'%PDF-')],
+}
+
+# ── 폴리글랏/악성 패턴: 전체 파일 스캔 ───────────────────────────────
+MALICIOUS_PATTERNS = [
+    # PHP 변형
+    b'<?php', b'<?\n', b'<? ', b'<?=',
+    # 스크립트 태그 (SVG XSS)
+    b'<script', b'javascript:',
+    # 위험 함수
+    b'eval(', b'exec(', b'system(', b'passthru(',
+    b'shell_exec(', b'popen(', b'proc_open(',
+    b'base64_decode(', b'assert(', b'preg_replace(',
+    # 시스템 명령
+    b'cmd.exe', b'/bin/sh', b'/bin/bash',
+    b'powershell', b'WScript.Shell', b'CreateObject(',
+    # Phar 폴리글랏
+    b'__HALT_COMPILER',
+    # Null byte 인젝션
+    b'\x00.',
 ]
 
-def allowed_extension(filename):
-    """Layer 1: 확장자 Whitelist 검사"""
-    if '.' not in filename:
+
+# ══════════════════════════════════════════════════════════
+# Layer 1: 확장자 Whitelist (다중 확장자 차단 강화)
+# ══════════════════════════════════════════════════════════
+def check_extension(filename: str) -> bool:
+    """
+    다중 확장자 공격 차단: shell.php.jpg, shell.jpg.php 등
+    → 마지막 확장자만 허용하되, 중간에 위험 확장자 있으면 차단
+    """
+    parts = filename.lower().split('.')
+    if len(parts) < 2:
         return False
-    ext = filename.rsplit('.', 1)[1].lower()
-    return ext in ALLOWED_EXTENSIONS
+    
+    DANGEROUS_EXTENSIONS = {
+        'php', 'php3', 'php4', 'php5', 'php7', 'phtml', 'phar',
+        'asp', 'aspx', 'jsp', 'jspx', 'cfm', 'cgi', 'pl',
+        'py', 'rb', 'sh', 'bash', 'exe', 'dll', 'bat', 'cmd',
+        'htaccess', 'htpasswd', 'ini', 'config', 'env'
+    }
+    
+    # 모든 확장자 파트에 위험 확장자 있으면 차단
+    for part in parts[1:]:
+        if part in DANGEROUS_EXTENSIONS:
+            return False
+    
+    # 마지막 확장자만 허용 목록 확인
+    return parts[-1] in ALLOWED_EXTENSIONS
 
 
-def get_magic_mime(file_bytes):
-    """Layer 3: Magic Number (파일 시그니처) 검사  bytes 기반으로 정확도 향상"""
+# ══════════════════════════════════════════════════════════
+# Layer 2: MIME 헤더 검사 (Content-Type 스푸핑 탐지)
+# ══════════════════════════════════════════════════════════
+def check_content_type(content_type: str) -> bool:
+    if not content_type:
+        return False
+    # 파라미터 제거: "image/jpeg; charset=utf-8" → "image/jpeg"
+    mime = content_type.split(';')[0].strip().lower()
+    return mime in ALLOWED_MIMES
+
+
+# ══════════════════════════════════════════════════════════
+# Layer 3 (강화): 매직 바이트 직접 검증 + 전체 파일 스캔
+# ══════════════════════════════════════════════════════════
+def check_magic_bytes(file_content: bytes) -> tuple[bool, str | None]:
+    """
+    python-magic 의존 없이 직접 매직 바이트 비교.
+    → 라이브러리 우회 공격 방어
+    """
+    for mime_type, signatures in MAGIC_SIGNATURES.items():
+        for offset, sig in signatures:
+            if file_content[offset:offset + len(sig)] == sig:
+                return True, mime_type
+    return False, None
+
+
+def check_magic_mime_lib(file_content: bytes) -> str | None:
+    """python-magic 라이브러리 검사 (교차 검증용)"""
     try:
-        return magic.from_buffer(file_bytes[:2048], mime=True) if file_bytes else None
-    except:
+        # 전체 파일 검사로 변경 (핵심 수정)
+        return magic.from_buffer(file_content, mime=True)
+    except Exception:
         return None
 
 
-def scan_with_clamav(file_content: bytes) -> bool:
-    """Layer 4: AV 시그니처 스캐닝 시뮬레이션 (ClamAV 모킹)"""
-    # 실제 시스템 AV처럼 동작하도록 메모리 바이트를 직접 스캔
+def scan_malicious_patterns(file_content: bytes) -> tuple[bool, bytes | None]:
+    """
+    전체 파일에서 악성 패턴 검색.
+    대소문자 무시 + null byte 처리
+    """
+    content_lower = file_content.lower()
+    # null byte 제거 후 재검사 (null byte 인젝션 우회 방어)
+    content_no_null = file_content.replace(b'\x00', b'').lower()
+    
+    for pattern in MALICIOUS_PATTERNS:
+        if pattern.lower() in content_lower:
+            return False, pattern
+        if pattern.lower() in content_no_null:
+            return False, pattern
+    return True, None
+
+
+# ══════════════════════════════════════════════════════════
+# Layer 4: 이미지 재인코딩 (핵심 방어)
+# ══════════════════════════════════════════════════════════
+def sanitize_image(file_content: bytes, save_path: str) -> tuple[bool, str]:
+    """
+    PIL로 픽셀 데이터만 추출 후 재인코딩.
+    → 메타데이터(EXIF), 숨겨진 페이로드, 폴리글랏 완전 제거
+    """
     try:
-        content_lower = file_content.lower()
-        for sig in MALWARE_SIGNATURES:
-            if sig.lower() in content_lower:
-                print(f"[-] ClamAV 시그니처 탐지: {sig}")
-                return False  # 악성코드 탐지됨
-        return True  # 안전
+        with Image.open(io.BytesIO(file_content)) as img:
+            # 해상도 검사
+            if img.width * img.height > 50_000_000:
+                return False, "이미지 해상도 초과 (DoS 방어)"
+            
+            # 최소 크기 검사
+            if img.width < 1 or img.height < 1:
+                return False, "유효하지 않은 이미지 크기"
+            
+            # 픽셀 데이터만 추출 (페이로드 완전 제거)
+            clean_img = img.convert('RGB')
+            
+            # 새 파일로 저장 (원본 바이트 일절 사용 안 함)
+            clean_img.save(save_path, 'JPEG', quality=85, optimize=True)
+            return True, "OK"
+            
+    except UnidentifiedImageError:
+        return False, "PIL이 인식 불가한 이미지"
     except Exception as e:
-        print(f"[-] AV 스캔 에러: {e} (fail-closed 적용으로 차단)")
-        return False
+        return False, f"이미지 처리 오류: {e}"
 
 
+# ══════════════════════════════════════════════════════════
+# Layer 5: PDF 검사 (별도 처리)
+# ══════════════════════════════════════════════════════════
+def check_pdf_safety(file_content: bytes) -> tuple[bool, str]:
+    """
+    PDF 내 위험 요소 검사.
+    JavaScript, 외부 링크, 액션 등 차단
+    """
+    DANGEROUS_PDF_PATTERNS = [
+        b'/JavaScript', b'/JS ',
+        b'/AA ',           # Additional Actions
+        b'/OpenAction',
+        b'/Launch',
+        b'/EmbeddedFile',
+        b'/XFA',           # XML Forms (XXE 위험)
+        b'<<\n/Type /Action',
+    ]
+    
+    for pattern in DANGEROUS_PDF_PATTERNS:
+        if pattern in file_content:
+            return False, f"위험한 PDF 요소 탐지: {pattern}"
+    
+    return True, "OK"
+
+
+# ══════════════════════════════════════════════════════════
+# 메인 업로드 라우트
+# ══════════════════════════════════════════════════════════
 @app.route('/upload', methods=['POST'])
 def secure_upload():
     if 'file' not in request.files:
-        return jsonify({"error": "파일이 없습니다."}), 400
-    
+        return jsonify({"error": "파일이 없습니다"}), 400
+
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "파일명이 없습니다."}), 400
+    if not file.filename:
+        return jsonify({"error": "파일명이 없습니다"}), 400
 
-    original_filename = file.filename
+    original_filename = secure_filename(file.filename)
+    file_hash = None
 
-    # ==================== Layer 1: 확장자 Whitelist ====================
-    if not allowed_extension(original_filename):
-        return jsonify({"error": "허용되지 않은 파일 확장자입니다."}), 403
+    # ── Layer 1: 확장자 ──────────────────────────────────────
+    if not check_extension(original_filename):
+        return jsonify({"error": "L1: 허용되지 않은 확장자 또는 다중 확장자 공격"}), 403
 
-    # ==================== Layer 2: MIME 타입 검사 (보조) ====================
-    if file.content_type and file.content_type not in ALLOWED_MIMES:
-        return jsonify({"error": "허용되지 않은 MIME 타입입니다."}), 403
+    # ── Layer 2: Content-Type 헤더 ───────────────────────────
+    if not check_content_type(file.content_type or ''):
+        return jsonify({"error": "L2: 허용되지 않은 Content-Type"}), 403
 
-    # 전체 파일 내용을 한 번만 읽음 (메모리 효율 + ClamAV/Magic 공용)
+    # 파일 읽기 (한 번만)
     file_content = file.read()
-    if len(file_content) == 0:
-        return jsonify({"error": "빈 파일입니다."}), 400
+    if not file_content:
+        return jsonify({"error": "빈 파일"}), 400
 
-    # ==================== Layer 3: Magic Number 검사 (exact match + SVG 등 차단) ====================
-    detected_mime = get_magic_mime(file_content)
-    if detected_mime and detected_mime not in ALLOWED_MIMES:
+    file_hash = hashlib.sha256(file_content).hexdigest()
+
+    # ── Layer 3a: 직접 매직 바이트 검증 ─────────────────────
+    magic_ok, detected_type = check_magic_bytes(file_content)
+    if not magic_ok:
+        return jsonify({"error": "L3a: 매직 바이트 불일치"}), 403
+
+    # ── Layer 3b: python-magic 교차 검증 ─────────────────────
+    lib_mime = check_magic_mime_lib(file_content)
+    if lib_mime and lib_mime != detected_type:
         return jsonify({
-            "error": "파일 시그니처(Magic Number)가 허용된 타입과 일치하지 않습니다. (SVG, script 등 차단)"
+            "error": f"L3b: MIME 불일치 (직접검사={detected_type}, 라이브러리={lib_mime})"
         }), 403
 
-    # ==================== Layer 4: ClamAV 스캐닝 (fail-closed) ====================
-    if not scan_with_clamav(file_content):
-        return jsonify({"error": "악성코드가 탐지되었거나 AV 스캔에 실패했습니다."}), 403
+    # ── Layer 3c: 전체 파일 악성 패턴 스캔 ───────────────────
+    pattern_ok, found_pattern = scan_malicious_patterns(file_content)
+    if not pattern_ok:
+        return jsonify({"error": f"L3c: 악성 패턴 탐지: {found_pattern}"}), 403
 
-    # ==================== Layer 5: 안전한 저장 처리 ====================
-    # 이미지인 경우 무조건 .jpg로 강제 변환 (확장자 혼선 방지)
-    if detected_mime and detected_mime.startswith('image/'):
-        safe_ext = 'jpg'
-    else:
-        ext = secure_filename(original_filename).rsplit('.', 1)[-1].lower()
-        safe_ext = ext
+    # ── Layer 4: 타입별 처리 ─────────────────────────────────
+    safe_filename = f"{uuid.uuid4().hex}"
+    
+    if detected_type and detected_type.startswith('image/'):
+        save_path = os.path.join(SECURE_UPLOAD_FOLDER, f"{safe_filename}.jpg")
+        success, msg = sanitize_image(file_content, save_path)
+        if not success:
+            return jsonify({"error": f"L4: 이미지 재인코딩 실패: {msg}"}), 403
+        final_filename = f"{safe_filename}.jpg"
 
-    safe_filename = f"{uuid.uuid4().hex}.{safe_ext}"
-    save_path = os.path.join(SECURE_UPLOAD_FOLDER, safe_filename)
-
-    # 이미지 처리 (metadata strip + RGB 변환 + 크기 제한)
-    if detected_mime and detected_mime.startswith('image/'):
-        try:
-            # PIL로 다시 열기 (stream 위치 초기화)
-            file.stream.seek(0)
-            with Image.open(file.stream) as img:
-                # pixel flood / decompression bomb 추가 방어
-                if img.width * img.height > 100_000_000:
-                    return jsonify({"error": "이미지 해상도가 너무 큽니다 (DoS 방어)."}), 403
-                
-                # 안전한 RGB 변환 + metadata 제거
-                img = img.convert('RGB')
-                img.save(save_path, 'JPEG', quality=85, optimize=True)
-        except (UnidentifiedImageError, Exception) as e:
-            print(f"[-] Image processing failed: {e}")
-            return jsonify({"error": "이미지 처리 중 오류가 발생했습니다."}), 403
-    else:
-        # PDF 등 일반 파일은 그대로 저장
+    elif detected_type == 'application/pdf':
+        pdf_ok, pdf_msg = check_pdf_safety(file_content)
+        if not pdf_ok:
+            return jsonify({"error": f"L4: {pdf_msg}"}), 403
+        save_path = os.path.join(SECURE_UPLOAD_FOLDER, f"{safe_filename}.pdf")
         with open(save_path, 'wb') as f:
             f.write(file_content)
+        final_filename = f"{safe_filename}.pdf"
 
-    # 실행 권한 완전 제거 (644)
+    else:
+        return jsonify({"error": "처리 불가 타입"}), 403
+
+    # ── Layer 5: 권한 강화 ───────────────────────────────────
     os.chmod(save_path, 0o644)
 
-    print(f"[+] 안전하게 저장됨: {safe_filename} (원본: {original_filename} | MIME: {detected_mime})")
+    print(f"[+] 저장완료: {final_filename} | SHA256: {file_hash[:16]}... | MIME: {detected_type}")
 
     return jsonify({
-        "message": "파일이 안전하게 업로드되었습니다.",
-        "filename": safe_filename,
-        "original_name": original_filename,
-        "path": f"/files/{safe_filename}"
+        "message": "업로드 성공",
+        "filename": final_filename,
+        "sha256": file_hash,
+        "detected_type": detected_type
     }), 200
 
 
-# ==================== 다운로드 라우트 (XSS 방지) ====================
+# ── 다운로드 ─────────────────────────────────────────────────────────
 @app.route('/files/<filename>')
 def serve_file(filename):
-    """보안 다운로드 라우트  Content-Type 정확 설정 + as_attachment=True (브라우저 실행 방지)"""
     safe_filename = secure_filename(filename)
-    if safe_filename != filename or '..' in filename or '/' in filename or '\\' in filename:
-        return jsonify({"error": "Invalid filename"}), 400
+    if safe_filename != filename or '..' in filename or '/' in filename:
+        return jsonify({"error": "잘못된 파일명"}), 400
 
     file_path = os.path.join(SECURE_UPLOAD_FOLDER, safe_filename)
     if not os.path.exists(file_path):
-        return jsonify({"error": "File not found"}), 404
+        return jsonify({"error": "파일 없음"}), 404
 
-    # 확장자에 따라 정확한 MIME 설정
-    if filename.endswith(('.jpg', '.jpeg')):
-        mimetype = 'image/jpeg'
-    elif filename.endswith('.png'):
-        mimetype = 'image/png'
-    elif filename.endswith('.gif'):
-        mimetype = 'image/gif'
-    elif filename.endswith('.pdf'):
-        mimetype = 'application/pdf'
-    else:
-        mimetype = 'application/octet-stream'
+    MIME_MAP = {
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.png': 'image/png',  '.gif': 'image/gif',
+        '.pdf': 'application/pdf',
+    }
+    ext = os.path.splitext(safe_filename)[1].lower()
+    mimetype = MIME_MAP.get(ext, 'application/octet-stream')
 
-    # as_attachment=True  브라우저에서 자동 실행(XSS) 방지
     return send_from_directory(
-        SECURE_UPLOAD_FOLDER,
-        safe_filename,
+        SECURE_UPLOAD_FOLDER, safe_filename,
         mimetype=mimetype,
-        as_attachment=True
+        as_attachment=True,
+        download_name=safe_filename
     )
 
 
